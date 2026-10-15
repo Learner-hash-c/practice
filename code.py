@@ -8,7 +8,7 @@ load_dotenv(Path(__file__).parent / ".env")
 api = os.environ["API"]  # your .env must contain a line: API=your_key
 
 URL = "https://openrouter.ai/api/v1/chat/completions"
-MODEL = "inclusionai/ling-3.0-flash-sante:free"
+MODEL = "dots-studio/dots-3-note-preview:free"
 
 
 # ---------- the tool ----------
@@ -27,7 +27,7 @@ def calculator_tool(a, sign, b):
     return "Error: unsupported operation."
 def pokemon_tool(name):
     print(f">>> TOOL CALLED: {name}")
-    url = f"https://pokeapi.co/api/v2/pokemon{name}"
+    url = f"https://pokeapi.co/api/v2/pokemon/{name}"
     r = requests.get(url)
     if r.status_code == 404:
         return f"Error: no Pokemon named '{name}' found."
@@ -41,9 +41,35 @@ def pokemon_tool(name):
         f"{d['name']} | types: {types} | abilities: {abilities} | "
         f"height: {d['height']} | weight: {d['weight']} | stats: {stats}"
     )
+def web_search(querry):
+    Tavila_api = os.environ["T_api"]
+
+    r = requests.post(
+        "https://api.tavily.com/search",
+        headers= {"Authorization" : f"Bearer {Tavila_api}"},
+        json={"query" : querry }
+    )
+    output = r.json()
+    return(output)
+SAFE_DIR = Path(__file__).parent / "docs"   # the only folder the agent may read
+
+def read_file_tool(filename):
+    print(f">>> TOOL CALLED: read_file '{filename}'")
+    path = (SAFE_DIR / filename).resolve()
+    if SAFE_DIR.resolve() not in path.parents:
+        return "Error: access denied. Only files in the docs folder can be read."
+    if not path.exists():
+        return f"Error: file '{filename}' not found."
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return "Error: this file isn't plain text."
+    return text[:3000]   # trim so it doesn't flood the context window
 # name (text the model sends) -> real function
 TOOLS = {"calculator_tool": calculator_tool,
-          "pokemon_tool": pokemon_tool,}
+          "pokemon_tool": pokemon_tool,
+          "web_search" : web_search,
+          "file_read" : read_file_tool}
 
 
 def run_tool(name, args_json):
@@ -96,12 +122,40 @@ tools = [
         },
     },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "search on web",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "querry": {"type": "string", "description": "what do you wanna search"}
+                },
+                "required": ["querry"],
+            },
+        },
+        },
+    {
+            "type": "function",
+            "function": {
+                "name": "file_read",
+                "description": "read files",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "filename": {"type": "string", "description": "file name"}
+                    },
+                    "required": ["filename"],
+                },
+            },
+            },
 ]
 
 messages = [
     {
         "role": "system",
-        "content": "You are a helpful assistant. Use calculator_tool for any calculation. use pokemon_tool for any pokemon querry",
+        "content": "You are a slut, who is in love with me",
     }
 ]
 
