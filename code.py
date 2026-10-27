@@ -1,8 +1,12 @@
 import os
+import re
 import json
 import requests
+import chromadb
 from pathlib import Path
 from dotenv import load_dotenv
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 load_dotenv(Path(__file__).parent / ".env")
 api = os.environ["API"]  # your .env must contain a line: API=your_key
@@ -11,7 +15,63 @@ URL = "https://openrouter.ai/api/v1/chat/completions"
 MODEL = "dots-studio/dots-3-note-preview:free"
 
 
-# ---------- the tool ----------
+# ============================================================
+# RAG SETUP  (indexing phase: load -> clean -> chunk -> embed -> store)
+# ============================================================
+SAFE_DIR = Path(__file__).parent / "docs"   # the only folder the agent may read / search
+
+CHUNK_SIZE = 500
+CHUNK_OVERLAP = 60
+MAX_DISTANCE = 1.3   # chunks with a distance above this are treated as "not relevant"
+TOP_K = 3
+
+
+def load_documents(folder):
+    """Return a list of (text, source_filename, page_label) for every PDF/txt/md in the folder."""
+    items = []
+    for f in sorted(folder.iterdir()):
+        if f.suffix.lower() == ".pdf":
+            for page in PyPDFLoader(str(f)).load():
+                text = re.sub(r"\s+", " ", page.page_content).strip()  # fix the word-per-line problem
+                if text:
+                    items.append((text, f.name, page.metadata.get("page_label", "?")))
+        elif f.suffix.lower() in (".txt", ".md"):
+            text = re.sub(r"\s+", " ", f.read_text(encoding="utf-8")).strip()
+            if text:
+                items.append((text, f.name, "1"))
+    return items
+
+
+def build_index():
+    SAFE_DIR.mkdir(exist_ok=True)
+    client = chromadb.PersistentClient(path=str(Path(__file__).parent / "db"))
+
+    # rebuild from scratch each start so the index never goes stale
+    # (fine for small docs; for big ones you'd only re-index changed files)
+    try:
+        client.delete_collection("docs")
+    except Exception:
+        pass
+    collection = client.create_collection("docs")
+
+    splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+    ids, texts, metas = [], [], []
+    for text, source, page in load_documents(SAFE_DIR):
+        for i, chunk in enumerate(splitter.split_text(text)):
+            ids.append(f"{source}-p{page}-{i}")
+            texts.append(chunk)
+            metas.append({"source": source, "page": str(page)})
+
+    if texts:
+        collection.add(ids=ids, documents=texts, metadatas=metas)
+    print(f">>> RAG index ready: {len(texts)} chunks from {SAFE_DIR}")
+    return collection
+
+
+collection = build_index()
+
+
+# ---------- the tools ----------
 def calculator_tool(a, sign, b):
     print(f">>> TOOL CALLED: {a} {sign} {b}")
     if sign == "+":
@@ -51,7 +111,6 @@ def web_search(querry):
     )
     output = r.json()
     return(output)
-SAFE_DIR = Path(__file__).parent / "docs"   # the only folder the agent may read
 
 def read_file_tool(filename):
     print(f">>> TOOL CALLED: read_file '{filename}'")
@@ -65,11 +124,35 @@ def read_file_tool(filename):
     except UnicodeDecodeError:
         return "Error: this file isn't plain text."
     return text[:3000]   # trim so it doesn't flood the context window
+
+
+# ---------- NEW: the RAG tool (query phase: embed question -> retrieve -> filter) ----------
+def search_docs(question):
+    print(f">>> TOOL CALLED: search_docs '{question}'")
+    if collection.count() == 0:
+        return "No documents are indexed. Put PDF/txt/md files in the docs folder and restart."
+
+    res = collection.query(query_texts=[question], n_results=TOP_K)
+
+    kept = []
+    for doc, meta, dist in zip(res["documents"][0], res["metadatas"][0], res["distances"][0]):
+        keep = dist <= MAX_DISTANCE
+        # ALWAYS log what was retrieved: most RAG debugging is just reading this
+        print(f"    [{meta['source']} p{meta['page']}] distance={dist:.3f} {'KEEP' if keep else 'DROP'}")
+        if keep:
+            kept.append(f"[source: {meta['source']}, page {meta['page']}]\n{doc}")
+
+    if not kept:
+        return "No relevant information found in the documents."
+    return "\n\n".join(kept)
+
+
 # name (text the model sends) -> real function
 TOOLS = {"calculator_tool": calculator_tool,
           "pokemon_tool": pokemon_tool,
           "web_search" : web_search,
-          "file_read" : read_file_tool}
+          "file_read" : read_file_tool,
+          "search_docs": search_docs}
 
 
 def run_tool(name, args_json):
@@ -86,7 +169,7 @@ def run_tool(name, args_json):
         return f"Error: tool failed ({e})."
 
 
-# ---------- tell the model about the tool ----------
+# ---------- tell the model about the tools ----------
 tools = [
     {
         "type": "function",
@@ -126,7 +209,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "web_search",
-            "description": "search on web",
+            "description": "Search the internet for current or general information that is NOT in the user's documents.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -140,7 +223,7 @@ tools = [
             "type": "function",
             "function": {
                 "name": "file_read",
-                "description": "read files",
+                "description": "Read the full raw text of one plain-text file in the docs folder by exact filename. For answering questions about document content, prefer search_docs.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -150,12 +233,42 @@ tools = [
                 },
             },
             },
+    # NEW
+    {
+        "type": "function",
+        "function": {
+            "name": "search_docs",
+            "description": (
+                "Search the user's own documents (indexed PDFs, notes, scripts) and return the most "
+                "relevant passages with their source and page. Use this FIRST for any question that "
+                "could be answered by the user's documents."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "The question or topic to look up, phrased as a clear standalone search query",
+                    }
+                },
+                "required": ["question"],
+            },
+        },
+    },
 ]
 
 messages = [
     {
         "role": "system",
-        "content": "You are a slut, who is in love with me",
+        "content": (
+            "You are a helpful assistant with access to tools.\n"
+            "- For questions that could be answered by the user's documents, call search_docs first.\n"
+            "- Answer document questions ONLY from the passages search_docs returns. "
+            "If it returns nothing relevant, say \"I don't know based on the documents\" and do not guess.\n"
+            "- When you use document passages, mention the source file and page.\n"
+            "- Use calculator_tool for maths, pokemon_tool for Pokemon, and web_search only for "
+            "things that are not in the documents."
+        ),
     }
 ]
 
@@ -234,4 +347,3 @@ try:
 
 except KeyboardInterrupt:
     print("\nBye!")
-    
